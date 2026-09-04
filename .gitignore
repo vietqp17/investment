@@ -1,2 +1,25 @@
-discuss/
+discussion/
 
+.prettierrc
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
