@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REGISTRY: 408250704635.dkr.ecr.eu-north-1.amazonaws.com
+  EC2_INSTANCE_ID: i-0b6e21253e293c93c
+
 jobs:
   backend-test:
     runs-on: ubuntu-latest
@@ -33,3 +41,57 @@ jobs:
       - run: npm install
       - run: npm run test
       - run: npm run build
+
+  build-and-push:
+    needs: [backend-test, frontend-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "image_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - run: |
+          docker build -t $ECR_REGISTRY/investment-backend:${{ steps.tag.outputs.image_tag }} \
+                       -t $ECR_REGISTRY/investment-backend:latest ./backend
+          docker push $ECR_REGISTRY/investment-backend:${{ steps.tag.outputs.image_tag }}
+          docker push $ECR_REGISTRY/investment-backend:latest
+      - run: |
+          docker build -t $ECR_REGISTRY/investment-frontend:${{ steps.tag.outputs.image_tag }} \
+                       -t $ECR_REGISTRY/investment-frontend:latest ./frontend
+          docker push $ECR_REGISTRY/investment-frontend:${{ steps.tag.outputs.image_tag }}
+          docker push $ECR_REGISTRY/investment-frontend:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy investment app ${{ needs.build-and-push.outputs.image_tag }}" \
+            --parameters commands="[\"cd /home/ubuntu/investment && git fetch origin main && git reset --hard origin/main && export ECR_REGISTRY=$ECR_REGISTRY && export IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }} && aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY && docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d && docker image prune -f\"]" \
+            --query "Command.CommandId" --output text)
+          echo "Command ID: $COMMAND_ID"
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID"
+          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --query Status --output text)
+          [ "$STATUS" = "Success" ]
